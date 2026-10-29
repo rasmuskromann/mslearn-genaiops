@@ -6,7 +6,7 @@ This script:
 2. Loads prompt versions v1, v2, v3 from the prompts directory
 3. Runs all test prompts against each version using direct chat completions
 4. Wraps each version in a named trace span for side-by-side comparison
-5. Captures token usage, latency, and response data per prompt
+5. Captures token usage, latency, and prompt/response content per prompt
 """
 
 import os
@@ -37,6 +37,10 @@ connection_string = project_client.telemetry.get_application_insights_connection
 
 # Set as env var so all SDK components can discover it automatically
 os.environ["APPLICATIONINSIGHTS_CONNECTION_STRING"] = connection_string
+
+# Record prompt and response text on GenAI spans (off by default).
+# Set to "false" in .env to keep message content out of Application Insights.
+os.environ.setdefault("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "true")
 
 configure_azure_monitor(connection_string=connection_string)
 OpenAIInstrumentor().instrument()
