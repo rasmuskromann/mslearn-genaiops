@@ -34,7 +34,6 @@ project_client = AIProjectClient(
     credential=DefaultAzureCredential(),
 )
 connection_string = project_client.telemetry.get_application_insights_connection_string()
-print(f"[DEBUG] Connection string: {connection_string}")
 
 # Set as env var so all SDK components can discover it automatically
 os.environ["APPLICATIONINSIGHTS_CONNECTION_STRING"] = connection_string
@@ -51,7 +50,7 @@ token_provider = get_bearer_token_provider(
 chat_client = AzureOpenAI(
     azure_endpoint=openai_endpoint,
     azure_ad_token_provider=token_provider,
-    api_version="2024-10-21",
+    api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2025-04-01-preview"),
 )
 
 # Paths to prompt versions and test prompts
@@ -64,13 +63,13 @@ VERSIONS = ["v1", "v2", "v3"]
 
 def load_prompt(version: str) -> str:
     """Load a prompt version from the prompts directory."""
-    return (PROMPTS_DIR / f"{version}_instructions.txt").read_text().strip()
+    return (PROMPTS_DIR / f"{version}_instructions.txt").read_text(encoding="utf-8").strip()
 
 
 def load_test_prompts() -> dict:
     """Load all test prompts from the test-prompts directory."""
     return {
-        f.stem: f.read_text().strip()
+        f.stem: f.read_text(encoding="utf-8").strip()
         for f in sorted(TEST_PROMPTS_DIR.glob("*.txt"))
     }
 
@@ -96,27 +95,43 @@ def run_version(version: str, system_prompt: str, test_prompts: dict):
                 span.set_attribute("session.id", session_id)
 
                 start = time.time()
-                response = chat_client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt_text},
-                    ],
-                )
+                try:
+                    response = chat_client.chat.completions.create(
+                        model=model_name,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": prompt_text},
+                        ],
+                    )
+                except Exception as e:
+                    # Record the failure on the span and continue with the next test
+                    span.record_exception(e)
+                    span.set_status(trace.Status(trace.StatusCode.ERROR, str(e)))
+                    print(f"    ERROR    : {e}")
+                    continue
                 duration = time.time() - start
 
-                output = response.choices[0].message.content
+                choice = response.choices[0] if response.choices else None
+                output = (choice.message.content if choice else None) or ""
                 usage = response.usage
 
                 span.set_attribute("response.duration_s", round(duration, 3))
-                span.set_attribute("response.prompt_tokens", usage.prompt_tokens)
-                span.set_attribute("response.completion_tokens", usage.completion_tokens)
-                span.set_attribute("response.total_tokens", usage.total_tokens)
+                if choice:
+                    span.set_attribute("response.finish_reason", choice.finish_reason or "")
+                if usage:
+                    span.set_attribute("response.prompt_tokens", usage.prompt_tokens)
+                    span.set_attribute("response.completion_tokens", usage.completion_tokens)
+                    span.set_attribute("response.total_tokens", usage.total_tokens)
 
                 print(f"    Duration : {duration:.2f}s")
-                print(f"    Tokens   : {usage.total_tokens} "
-                      f"(prompt: {usage.prompt_tokens}, completion: {usage.completion_tokens})")
-                print(f"    Response : {output[:80]}...")
+                if usage:
+                    print(f"    Tokens   : {usage.total_tokens} "
+                          f"(prompt: {usage.prompt_tokens}, completion: {usage.completion_tokens})")
+                if output:
+                    print(f"    Response : {output[:80]}...")
+                else:
+                    finish = choice.finish_reason if choice else "no choices"
+                    print(f"    Response : <empty> (finish_reason: {finish})")
 
 
 if __name__ == "__main__":
@@ -128,17 +143,18 @@ if __name__ == "__main__":
     print(f"Loaded {len(test_prompts)} test prompts")
     print(f"Running versions: {', '.join(VERSIONS)}")
 
-    for version in VERSIONS:
-        system_prompt = load_prompt(version)
-        run_version(version, system_prompt, test_prompts)
+    try:
+        for version in VERSIONS:
+            system_prompt = load_prompt(version)
+            run_version(version, system_prompt, test_prompts)
 
-    print(f"\n{'='*60}")
-    print("All versions complete.")
-    print("Open Azure AI Foundry > Tracing to compare spans across versions.")
-    print(f"{'='*60}")
-
-    # Force flush all telemetry before exit
-    provider = trace.get_tracer_provider()
-    if hasattr(provider, "force_flush"):
-        provider.force_flush()
-        print("Telemetry flushed.")
+        print(f"\n{'='*60}")
+        print("All versions complete.")
+        print("Open Azure AI Foundry > Tracing to compare spans across versions.")
+        print(f"{'='*60}")
+    finally:
+        # Force flush all telemetry before exit, even if the run was interrupted
+        provider = trace.get_tracer_provider()
+        if hasattr(provider, "force_flush"):
+            provider.force_flush()
+            print("Telemetry flushed.")
